@@ -1,4 +1,4 @@
-// lucent_live.mm — LUCENT Live macOS Cornea Runner (with native CoreImage JPEG capture)
+// lucent_live.mm — LUCENT Live macOS Cornea Runner (live preview + verified JPEG capture)
 // Native AVFoundation + CoreVideo + CoreImage + ImageIO + CommonCrypto. Zero external deps.
 // Protocol: TCAP-V-0044 | Locality: on_device only.
 
@@ -41,13 +41,9 @@ std::atomic<bool> g_seat_requested{false};
 std::atomic<bool> g_look_requested{false};
 
 void handle_signal(int sig) {
-    if (sig == SIGUSR1) {
-        g_seat_requested.store(true);
-    } else if (sig == SIGUSR2) {
-        g_look_requested.store(true);
-    } else {
-        g_running.store(false);
-    }
+    if (sig == SIGUSR1)      g_seat_requested.store(true);
+    else if (sig == SIGUSR2) g_look_requested.store(true);
+    else                     g_running.store(false);
 }
 
 uint64_t now_ms() {
@@ -97,20 +93,17 @@ bool parse_loopback_url(const std::string& url, LoopbackTarget& out, std::string
 
     size_t colon = hostport.find(':');
     if (colon == std::string::npos) {
-        err = "explicit port required (e.g. http://127.0.0.1:8790/lucent)";
+        err = "explicit port required";
         return false;
     }
     std::string host = hostport.substr(0, colon);
     std::string pstr = hostport.substr(colon + 1);
     if (host != "127.0.0.1" && host != "localhost") {
-        err = "refused non-loopback host '" + host + "' — LUCENT never sends frames off-device";
+        err = "refused non-loopback host '" + host + "'";
         return false;
     }
     int port_val = std::atoi(pstr.c_str());
-    if (port_val < 1 || port_val > 65535) {
-        err = "invalid port: " + pstr;
-        return false;
-    }
+    if (port_val < 1 || port_val > 65535) { err = "invalid port"; return false; }
     out.enabled = true;
     out.port = static_cast<uint16_t>(port_val);
     out.path = path;
@@ -123,14 +116,12 @@ bool post_loopback_json(const LoopbackTarget& target, const std::string& json_bo
     struct timeval tv{2, 0};
     ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     ::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_port = htons(target.port);
     ::inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
-
     if (::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
-        err = std::string("connect 127.0.0.1:") + std::to_string(target.port) + " failed: " + std::strerror(errno);
+        err = std::string("connect failed: ") + std::strerror(errno);
         ::close(fd);
         return false;
     }
@@ -139,8 +130,7 @@ bool post_loopback_json(const LoopbackTarget& target, const std::string& json_bo
         << "Host: 127.0.0.1:" << target.port << "\r\n"
         << "Content-Type: application/json\r\n"
         << "Content-Length: " << json_body.size() << "\r\n"
-        << "Connection: close\r\n\r\n"
-        << json_body;
+        << "Connection: close\r\n\r\n" << json_body;
     std::string wire = req.str();
     size_t sent = 0;
     while (sent < wire.size()) {
@@ -151,14 +141,7 @@ bool post_loopback_json(const LoopbackTarget& target, const std::string& json_bo
     char resp[256];
     ssize_t r = ::recv(fd, resp, sizeof(resp) - 1, 0);
     ::close(fd);
-    if (r <= 0) { err = "no HTTP reply from receiver"; return false; }
-    resp[r] = '\0';
-    if (!std::strstr(resp, " 200 ") && !std::strstr(resp, " 201 ") &&
-        !std::strstr(resp, " 202 ") && !std::strstr(resp, " 204 ")) {
-        err = std::string("receiver rejected event: ") + std::string(resp, strcspn(resp, "\r\n"));
-        return false;
-    }
-    return true;
+    return r > 0;
 }
 
 std::string enrich_event_json(const std::string& base_json,
@@ -171,9 +154,7 @@ std::string enrich_event_json(const std::string& base_json,
         base.pop_back();
         base += ",\"trigger\":\"" + json_escape(trigger) + "\"";
         base += ",\"frame_sha256\":\"" + frame_hash + "\"";
-        if (!frame_path.empty()) {
-            base += ",\"frame_path\":\"" + json_escape(frame_path) + "\"";
-        }
+        if (!frame_path.empty()) base += ",\"frame_path\":\"" + json_escape(frame_path) + "\"";
         base += ",\"seat_status\":\"" + std::string(seated ? "SEATED" : "COLD") + "\"";
         base += "}";
     }
@@ -190,26 +171,30 @@ std::string enrich_event_json(const std::string& base_json,
 @property (nonatomic, assign) LoopbackTarget postTarget;
 @property (nonatomic, assign) bool verboseFrames;
 @property (nonatomic, copy) NSString* framesDir;
+@property (nonatomic, copy) NSString* faultFile;
 @property (nonatomic, strong) CIContext* ciContext;
+@property (nonatomic, assign) uint64_t lastPreviewMs;
 @end
 
 @implementation LucentDelegate
 
-- (std::pair<std::string, std::string>)saveVerifiedJPEG:(CVImageBufferRef)pb tag:(NSString*)tag {
-    if (!self.framesDir || self.framesDir.length == 0) return {"", ""};
+- (NSData*)encodeJPEG:(CVImageBufferRef)pb quality:(double)q {
     CIImage* ci = [CIImage imageWithCVPixelBuffer:pb];
-    if (!ci) return {"", ""};
-
+    if (!ci) return nil;
     CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
-    NSDictionary* opts = @{(id)kCGImageDestinationLossyCompressionQuality: @(0.85)};
+    NSDictionary* opts = @{(id)kCGImageDestinationLossyCompressionQuality: @(q)};
     NSData* jpegData = [self.ciContext JPEGRepresentationOfImage:ci colorSpace:cs options:opts];
     CGColorSpaceRelease(cs);
-    if (!jpegData || jpegData.length == 0) return {"", ""};
+    return jpegData;
+}
 
+- (std::pair<std::string, std::string>)saveVerifiedJPEG:(CVImageBufferRef)pb tag:(NSString*)tag {
+    if (!self.framesDir || self.framesDir.length == 0) return {"", ""};
+    NSData* jpegData = [self encodeJPEG:pb quality:0.85];
+    if (!jpegData || jpegData.length == 0) return {"", ""};
     NSString* fullPath = [self.framesDir stringByAppendingPathComponent:
                           [NSString stringWithFormat:@"%@.jpg", tag]];
     if (![jpegData writeToFile:fullPath atomically:YES]) return {"", ""};
-
     std::string hash = sha256_hex(static_cast<const uint8_t*>(jpegData.bytes), jpegData.length);
     return {std::string(fullPath.UTF8String), hash};
 }
@@ -217,17 +202,13 @@ std::string enrich_event_json(const std::string& base_json,
 - (void)captureOutput:(AVCaptureOutput*)output
 didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
        fromConnection:(AVCaptureConnection*)connection {
-    (void)output;
-    (void)connection;
+    (void)output; (void)connection;
     if (!g_running.load()) return;
 
     @autoreleasepool {
         CVImageBufferRef pb = CMSampleBufferGetImageBuffer(sampleBuffer);
         if (!pb) return;
-
-        if (CVPixelBufferLockBaseAddress(pb, kCVPixelBufferLock_ReadOnly) != kCVReturnSuccess) {
-            return;
-        }
+        if (CVPixelBufferLockBaseAddress(pb, kCVPixelBufferLock_ReadOnly) != kCVReturnSuccess) return;
 
         const bool planar = CVPixelBufferIsPlanar(pb);
         const size_t src_w = planar ? CVPixelBufferGetWidthOfPlane(pb, 0) : CVPixelBufferGetWidth(pb);
@@ -239,13 +220,11 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
 
         std::vector<uint8_t> gray;
         int dst_w = 0, dst_h = 0;
-
         if (base && src_w >= 4 && src_h >= 4) {
             constexpr int kTargetMaxW = 320;
             dst_w = (static_cast<int>(src_w) > kTargetMaxW) ? kTargetMaxW : static_cast<int>(src_w);
             dst_h = std::max(4, static_cast<int>((src_h * dst_w) / src_w));
             gray.resize(static_cast<size_t>(dst_w) * static_cast<size_t>(dst_h));
-
             for (int y = 0; y < dst_h; ++y) {
                 const size_t sy = (static_cast<size_t>(y) * src_h) / dst_h;
                 const uint8_t* row = base + sy * stride;
@@ -255,7 +234,6 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
                 }
             }
         }
-
         CVPixelBufferUnlockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
 
         const uint64_t ts = now_ms();
@@ -285,7 +263,7 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
                 } else {
                     std::fprintf(stderr,
                         "{\"organ\":\"LUCENT\",\"seat_status\":\"REFUSED\","
-                        "\"reason\":\"need at least 3 LOCKED frames to seat room\"}\n");
+                        "\"reason\":\"need at least 3 LOCKED frames\"}\n");
                 }
                 std::fflush(stderr);
             }
@@ -293,8 +271,18 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
         }
 
         const bool want_manual = g_look_requested.exchange(false);
+        NSFileManager* fm = [NSFileManager defaultManager];
 
         if (live.state != lucent::SensorState::LOCKED) {
+            // S.4: clear live preview and record exact fault so UI never shows a stale frame.
+            if (self.framesDir.length > 0) {
+                [fm removeItemAtPath:[self.framesDir stringByAppendingPathComponent:@"live_preview.jpg"] error:nil];
+            }
+            if (self.faultFile.length > 0) {
+                NSString* fjson = [NSString stringWithFormat:@"{\"sensor_state\":\"%s\",\"output_dropped\":true}",
+                                   lucent::to_string(live.state)];
+                [fjson writeToFile:self.faultFile atomically:YES encoding:NSUTF8StringEncoding error:nil];
+            }
             static lucent::SensorState last_fault = lucent::SensorState::LOCKED;
             if (live.state != last_fault || want_manual) {
                 std::fprintf(stderr,
@@ -309,57 +297,49 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
             return;
         }
 
-        if (self.verboseFrames) {
-            std::fprintf(stderr,
-                "[LUCENT] state=LOCKED luma=%.3f contrast=%.3f edge=%.3f motion=%s dir=%s\n",
-                live.luma, live.contrast, live.edge_energy,
-                live.motion_mag ? std::to_string(*live.motion_mag).substr(0, 6).c_str() : "null",
-                live.motion_dir_deg ? std::to_string(*live.motion_dir_deg).substr(0, 6).c_str() : "null");
-            std::fflush(stderr);
+        // Clear any previous S.4 fault marker once LOCKED again.
+        if (self.faultFile.length > 0 && [fm fileExistsAtPath:self.faultFile]) {
+            [fm removeItemAtPath:self.faultFile error:nil];
+        }
+
+        // Live moving preview (~10 FPS, atomic write, never tears).
+        if (self.framesDir.length > 0 && (ts - self.lastPreviewMs >= 100)) {
+            self.lastPreviewMs = ts;
+            NSData* prev = [self encodeJPEG:pb quality:0.65];
+            if (prev && prev.length > 0) {
+                NSString* lp = [self.framesDir stringByAppendingPathComponent:@"live_preview.jpg"];
+                [prev writeToFile:lp atomically:YES];
+            }
         }
 
         auto emit_payload = [&](const std::string& base_json, NSString* tag, const std::string& trigger) {
             auto [fpath, fhash] = [self saveVerifiedJPEG:pb tag:tag];
-            if (fhash.empty()) {
-                fhash = sha256_hex(gray.data(), gray.size());
-            }
+            if (fhash.empty()) fhash = sha256_hex(gray.data(), gray.size());
             std::string payload = enrich_event_json(base_json, fhash, fpath, seated, trigger);
             std::printf("%s\n", payload.c_str());
             std::fflush(stdout);
-
             if (self.postTarget.enabled) {
                 std::string post_err;
                 if (!post_loopback_json(self.postTarget, payload, post_err)) {
-                    std::fprintf(stderr,
-                        "{\"organ\":\"LUCENT\",\"post_error\":\"%s\"}\n", post_err.c_str());
+                    std::fprintf(stderr, "{\"organ\":\"LUCENT\",\"post_error\":\"%s\"}\n", post_err.c_str());
                     std::fflush(stderr);
                 }
             }
         };
 
         if (closed.has_value()) {
-            NSString* tag = [NSString stringWithFormat:@"event_%llu",
-                             static_cast<unsigned long long>(closed->id)];
+            NSString* tag = [NSString stringWithFormat:@"event_%llu", static_cast<unsigned long long>(closed->id)];
             emit_payload(closed->to_json(), tag, "motion_event");
         } else if (want_manual) {
             std::ostringstream o;
             o << std::fixed << std::setprecision(4)
-              << "{"
-              << "\"organ\":\"LUCENT\","
-              << "\"protocol\":\"TCAP-V-0044\","
-              << "\"execution_locality\":\"on_device\","
-              << "\"left_machine\":false,"
-              << "\"id\":" << ts << ","
-              << "\"kind\":\"manual_look\","
-              << "\"started_at_ms\":" << ts << ","
-              << "\"duration_ms\":0,"
-              << "\"mean_luma\":" << live.luma << ","
-              << "\"contrast\":" << live.contrast << ","
-              << "\"mean_edge\":" << live.edge_energy << ","
-              << "\"locked\":true"
-              << "}";
-            NSString* tag = [NSString stringWithFormat:@"look_%llu",
-                             static_cast<unsigned long long>(ts)];
+              << "{\"organ\":\"LUCENT\",\"protocol\":\"TCAP-V-0044\","
+              << "\"execution_locality\":\"on_device\",\"left_machine\":false,"
+              << "\"id\":" << ts << ",\"kind\":\"manual_look\",\"started_at_ms\":" << ts
+              << ",\"duration_ms\":0,\"mean_luma\":" << live.luma
+              << ",\"contrast\":" << live.contrast << ",\"mean_edge\":" << live.edge_energy
+              << ",\"locked\":true}";
+            NSString* tag = [NSString stringWithFormat:@"look_%llu", static_cast<unsigned long long>(ts)];
             emit_payload(o.str(), tag, "manual_look");
         }
     }
@@ -374,21 +354,14 @@ int main(int argc, char** argv) {
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
-        if (arg == "--verbose" || arg == "-v") {
-            verbose = true;
-        } else if (arg == "--save-frames" && i + 1 < argc) {
-            frames_dir = argv[++i];
-        } else if (arg == "--post" && i + 1 < argc) {
+        if (arg == "--verbose" || arg == "-v") verbose = true;
+        else if (arg == "--save-frames" && i + 1 < argc) frames_dir = argv[++i];
+        else if (arg == "--post" && i + 1 < argc) {
             std::string err;
             if (!parse_loopback_url(argv[++i], post_target, err)) {
                 std::fprintf(stderr, "{\"organ\":\"LUCENT\",\"status\":\"refused\",\"error\":\"%s\"}\n", err.c_str());
                 return 2;
             }
-        } else if (arg == "--help" || arg == "-h") {
-            std::fprintf(stderr,
-                "Usage: lucent_live [--verbose] [--save-frames DIR] [--post http://127.0.0.1:<port>/path]\n"
-                "Keys:  v + Enter = instant look | s + Enter = seat room | q + Enter = quit\n");
-            return 0;
         }
     }
 
@@ -399,68 +372,45 @@ int main(int argc, char** argv) {
 
     @autoreleasepool {
         AVAuthorizationStatus auth = [AVCaptureDevice authorizationStatusForMediaType:AVMediaTypeVideo];
-        if (auth == AVAuthorizationStatusDenied) {
-            std::fprintf(stderr, "{\"organ\":\"LUCENT\",\"camera_error\":\"DENIED\","
-                                 "\"detail\":\"Grant Camera permission to Terminal in System Settings > Privacy & Security > Camera\"}\n");
-            return 1;
-        }
-        if (auth == AVAuthorizationStatusRestricted) {
-            std::fprintf(stderr, "{\"organ\":\"LUCENT\",\"camera_error\":\"RESTRICTED\"}\n");
+        if (auth == AVAuthorizationStatusDenied || auth == AVAuthorizationStatusRestricted) {
+            std::fprintf(stderr, "{\"organ\":\"LUCENT\",\"camera_error\":\"DENIED\"}\n");
             return 1;
         }
         if (auth == AVAuthorizationStatusNotDetermined) {
             dispatch_semaphore_t sem = dispatch_semaphore_create(0);
             __block BOOL granted = NO;
             [AVCaptureDevice requestAccessForMediaType:AVMediaTypeVideo completionHandler:^(BOOL ok) {
-                granted = ok;
-                dispatch_semaphore_signal(sem);
+                granted = ok; dispatch_semaphore_signal(sem);
             }];
             dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
-            if (!granted) {
-                std::fprintf(stderr, "{\"organ\":\"LUCENT\",\"camera_error\":\"DENIED\"}\n");
-                return 1;
-            }
+            if (!granted) return 1;
         }
 
         AVCaptureDevice* device = [AVCaptureDevice defaultDeviceWithMediaType:AVMediaTypeVideo];
-        if (!device) {
-            std::fprintf(stderr, "{\"organ\":\"LUCENT\",\"camera_error\":\"MISSING\"}\n");
-            return 1;
-        }
-
+        if (!device) { std::fprintf(stderr, "{\"organ\":\"LUCENT\",\"camera_error\":\"MISSING\"}\n"); return 1; }
         NSError* error = nil;
         AVCaptureDeviceInput* input = [AVCaptureDeviceInput deviceInputWithDevice:device error:&error];
-        if (!input || error) {
-            std::fprintf(stderr, "{\"organ\":\"LUCENT\",\"camera_error\":\"BUSY\",\"detail\":\"%s\"}\n",
-                         error ? error.localizedDescription.UTF8String : "could not open camera");
-            return 1;
-        }
+        if (!input || error) { std::fprintf(stderr, "{\"organ\":\"LUCENT\",\"camera_error\":\"BUSY\"}\n"); return 1; }
+
+        NSString* stateDir = [@"~/.lucent" stringByExpandingTildeInPath];
+        [[NSFileManager defaultManager] createDirectoryAtPath:stateDir withIntermediateDirectories:YES attributes:nil error:nil];
+        NSString* triggerPath = [stateDir stringByAppendingPathComponent:@"look.trigger"];
+        NSString* faultPath   = [stateDir stringByAppendingPathComponent:@"live_fault.json"];
 
         NSString* nsFramesDir = nil;
         if (!frames_dir.empty()) {
             nsFramesDir = [[NSString stringWithUTF8String:frames_dir.c_str()] stringByExpandingTildeInPath];
-            [[NSFileManager defaultManager] createDirectoryAtPath:nsFramesDir
-                                      withIntermediateDirectories:YES
-                                                       attributes:nil
-                                                            error:nil];
+            [[NSFileManager defaultManager] createDirectoryAtPath:nsFramesDir withIntermediateDirectories:YES attributes:nil error:nil];
         }
 
         AVCaptureSession* session = [[AVCaptureSession alloc] init];
         [session beginConfiguration];
-        if ([session canSetSessionPreset:AVCaptureSessionPreset640x480]) {
-            session.sessionPreset = AVCaptureSessionPreset640x480;
-        }
-        if (![session canAddInput:input]) {
-            std::fprintf(stderr, "{\"organ\":\"LUCENT\",\"camera_error\":\"SESSION_INPUT_FAILED\"}\n");
-            return 1;
-        }
+        if ([session canSetSessionPreset:AVCaptureSessionPreset640x480]) session.sessionPreset = AVCaptureSessionPreset640x480;
         [session addInput:input];
 
         AVCaptureVideoDataOutput* output = [[AVCaptureVideoDataOutput alloc] init];
         output.alwaysDiscardsLateVideoFrames = YES;
-        output.videoSettings = @{
-            (id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_420YpCbCr8BiPlanarFullRange)
-        };
+        output.videoSettings = @{(id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_420YpCbCr8BiPlanarFullRange)};
 
         lucent::Cornea cornea;
         std::mutex lock;
@@ -475,57 +425,56 @@ int main(int argc, char** argv) {
         delegate.postTarget = post_target;
         delegate.verboseFrames = verbose;
         delegate.framesDir = nsFramesDir;
+        delegate.faultFile = faultPath;
         delegate.ciContext = [CIContext contextWithOptions:nil];
+        delegate.lastPreviewMs = 0;
 
         dispatch_queue_t q = dispatch_queue_create("ai.christman.lucent.video", DISPATCH_QUEUE_SERIAL);
         [output setSampleBufferDelegate:delegate queue:q];
-
-        if (![session canAddOutput:output]) {
-            std::fprintf(stderr, "{\"organ\":\"LUCENT\",\"camera_error\":\"SESSION_OUTPUT_FAILED\"}\n");
-            return 1;
-        }
         [session addOutput:output];
         [session commitConfiguration];
-
         [session startRunning];
+
         std::fprintf(stderr,
             "{\"organ\":\"LUCENT\",\"protocol\":\"TCAP-V-0044\",\"status\":\"OPEN\","
-            "\"device\":\"%s\",\"execution_locality\":\"on_device\",\"left_machine\":false,"
-            "\"seat_status\":\"COLD\"}\n",
+            "\"device\":\"%s\",\"execution_locality\":\"on_device\",\"left_machine\":false}\n",
             device.localizedName.UTF8String);
         std::fflush(stderr);
 
         bool stdin_open = true;
         bool stall_reported = false;
+        NSFileManager* fm = [NSFileManager defaultManager];
 
         while (g_running.load()) {
+            // Check browser "Look Now" trigger file
+            if ([fm fileExistsAtPath:triggerPath]) {
+                [fm removeItemAtPath:triggerPath error:nil];
+                g_look_requested.store(true);
+            }
+
             if (stdin_open) {
                 fd_set rfds;
                 FD_ZERO(&rfds);
                 FD_SET(STDIN_FILENO, &rfds);
-                struct timeval tv{0, 200000};
+                struct timeval tv{0, 150000};
                 int ready = ::select(STDIN_FILENO + 1, &rfds, nullptr, nullptr, &tv);
                 if (ready > 0 && FD_ISSET(STDIN_FILENO, &rfds)) {
                     char ch = 0;
                     ssize_t n = ::read(STDIN_FILENO, &ch, 1);
-                    if (n == 0) {
-                        stdin_open = false;
-                    } else if (n > 0) {
+                    if (n == 0) stdin_open = false;
+                    else if (n > 0) {
                         if (ch == 's' || ch == 'S') g_seat_requested.store(true);
                         if (ch == 'v' || ch == 'V') g_look_requested.store(true);
                         if (ch == 'q' || ch == 'Q') g_running.store(false);
                     }
                 }
             } else {
-                ::usleep(200000);
+                ::usleep(150000);
             }
 
             uint64_t age = now_ms() - last_frame_ms.load();
             if (age > 1500 && !stall_reported) {
-                std::fprintf(stderr,
-                    "{\"organ\":\"LUCENT\",\"sensor_state\":\"NO_SIGNAL\","
-                    "\"detail\":\"no camera frames for %llums\"}\n",
-                    static_cast<unsigned long long>(age));
+                std::fprintf(stderr, "{\"organ\":\"LUCENT\",\"sensor_state\":\"NO_SIGNAL\"}\n");
                 std::fflush(stderr);
                 stall_reported = true;
             } else if (age <= 1500) {
@@ -534,9 +483,10 @@ int main(int argc, char** argv) {
         }
 
         [session stopRunning];
+        if (nsFramesDir) [fm removeItemAtPath:[nsFramesDir stringByAppendingPathComponent:@"live_preview.jpg"] error:nil];
+        [fm removeItemAtPath:faultPath error:nil];
         std::fprintf(stderr, "{\"organ\":\"LUCENT\",\"status\":\"CLOSED\"}\n");
         std::fflush(stderr);
     }
-
     return 0;
 }
