@@ -1,0 +1,13 @@
+lucent_live
+*.gguf
+*.safetensors
+*.bin
+*.jpg
+*.jpeg
+*.png
+*.jsonl
+frames/
+__pycache__/
+*.pyc
+.DS_Store
+.env
